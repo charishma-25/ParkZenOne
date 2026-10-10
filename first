@@ -1,0 +1,23 @@
+this is our first file in the ParkZen project.
+ParkZen idea: Suppose you wanna head to some shopping complex or a restaurant. You want to park your car in the parking slot
+After going inside, what if you won't find any place there, you need to come out again and park it near the complex somewhere 
+outside.. In this case, our time was consumed a lot and there might be a difficulty while coming out again due to parking congestion.
+Problem Statement::Finding an available parking space in crowded areas is time-consuming and inefficient.
+The main problems are:
+
+- Difficulty in identifying vacant parking slots.
+- Unnecessary time spent searching for parking.
+- Increased traffic and congestion inside parking areas.
+- No real-time information about parking availability.
+- Difficulty in locating the nearest available slot.
+
+So here's our idea where our model will get to know the parking slots wheather empty or occupied through CCTV footages. If someone want
+to enter this place and park their vehicle, this model will automatically detect the no.of parking slots available and if there's 
+any slot empty, this model will allot us with the nearest parking slot available like "Parking slot empty, go to A4".
+Dataset has been selected from roboflow.
+Created an ipynb file in which all the data cleaning and pre processing is done.
+Cleaning the dataset is successfully done through colab
+Done with training the model.
+Testing the models with different images.
+now we need to make the model robust
+robust means making sure the model works the best for any new images too but still figuring it out how mathematical framework works

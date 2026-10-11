@@ -281,6 +281,19 @@ def initialize():
         conn.executescript("""
         CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, name TEXT NOT NULL, email TEXT UNIQUE NOT NULL, mobile TEXT NOT NULL DEFAULT '', password TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'customer', destination_id TEXT REFERENCES destinations(id), created_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS sessions(token TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id), created_at TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS notifications(
+            id INTEGER PRIMARY KEY,
+            user_id INTEGER NOT NULL REFERENCES users(id),
+            title TEXT NOT NULL,
+            message TEXT NOT NULL,
+            notification_type TEXT NOT NULL,
+            related_booking_id INTEGER REFERENCES bookings(id),
+            reference TEXT,
+            event_key TEXT NOT NULL UNIQUE,
+            is_read INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS notifications_by_user_created ON notifications(user_id,created_at DESC,id DESC);
         CREATE TABLE IF NOT EXISTS destinations(id TEXT PRIMARY KEY, name TEXT NOT NULL, type TEXT NOT NULL, address TEXT NOT NULL, latitude REAL NOT NULL, longitude REAL NOT NULL, parking_ref TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS availability(destination_id TEXT NOT NULL REFERENCES destinations(id), level_id INTEGER PRIMARY KEY, total INTEGER NOT NULL, available INTEGER NOT NULL, occupied INTEGER NOT NULL, updated_at TEXT NOT NULL, manager_id INTEGER REFERENCES users(id));
         CREATE TABLE IF NOT EXISTS predictions(id INTEGER PRIMARY KEY, destination_id TEXT NOT NULL, level_id INTEGER, manager_id INTEGER NOT NULL, image_path TEXT NOT NULL, total INTEGER NOT NULL, available INTEGER NOT NULL, occupied INTEGER NOT NULL, slots TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL, confirmed_at TEXT);
@@ -586,6 +599,67 @@ def billable_overstay_minutes(start, end):
     seconds = max(0, (end - start).total_seconds())
     return math.ceil(seconds / 60) if seconds else 0
 
+def add_notification(conn, user_id, title, message, notification_type, event_key,
+                    related_booking_id=None, reference=None):
+    conn.execute("""
+        INSERT OR IGNORE INTO notifications(user_id,title,message,notification_type,
+            related_booking_id,reference,event_key,is_read,created_at)
+        VALUES(?,?,?,?,?,?,?,0,?)
+    """, (user_id, title, message, notification_type, related_booking_id,
+          reference, event_key, now()))
+
+def notify_overstay_state(conn, booking, case, previous_status, created=False):
+    ref = f"overstay:{case['id']}"
+    if created:
+        add_notification(conn, booking["customer_id"], "Overstay monitoring started",
+            f"Booking {booking['booking_code']} (slot {booking['slot_id']}) passed its reserved end time and is awaiting departure confirmation.",
+            "overstay", f"{ref}:created", booking["id"], ref)
+    if case["status"] != previous_status:
+        add_notification(conn, booking["customer_id"], "Overstay status updated",
+            f"Booking {booking['booking_code']} (slot {booking['slot_id']}) overstay status is now {case['status'].replace('_', ' ')}.",
+            "overstay_update", f"{ref}:status:{case['status']}", booking["id"], ref)
+    if case["final_penalty"] is not None and case["final_penalty"] > 0 and case["departure_detected_at"] and case["penalty_payment_status"] in ("pending", "not_due"):
+        add_notification(conn, booking["customer_id"], "Overstay penalty ready to pay",
+            f"The confirmed penalty for booking {booking['booking_code']} is ₹{case['final_penalty']}.",
+            "penalty_due", f"{ref}:penalty-due", booking["id"], ref)
+
+def create_due_duration_reminders(conn, current=None, customer_id=None):
+    """Persist one reminder per active booking expiry, based only on saved timestamps."""
+    current = current or datetime.now(timezone.utc)
+    query = """
+        SELECT b.id,b.customer_id,b.booking_code,b.start_time,b.expiry_time,b.created_at,
+               d.name AS destination_name,ps.slot_number
+        FROM bookings b JOIN destinations d ON d.id=b.destination_id
+        JOIN parking_slots ps ON ps.id=b.slot_id
+        WHERE b.status IN ('confirmed','active')
+    """
+    params = ()
+    if customer_id is not None:
+        query += " AND b.customer_id=?"
+        params = (customer_id,)
+    rows = conn.execute(query, params).fetchall()
+    created = 0
+    for booking in rows:
+        try:
+            starts = parse_booking_timestamp(booking["start_time"])
+            expiry = parse_booking_timestamp(booking["expiry_time"])
+            booked_at = parse_booking_timestamp(booking["created_at"])
+        except (TypeError, ValueError, OverflowError):
+            continue
+        reminder_at = expiry - timedelta(minutes=10)
+        if starts > current or current < reminder_at or current >= expiry or booked_at >= reminder_at:
+            continue
+        cursor = conn.execute("""
+            INSERT OR IGNORE INTO notifications(user_id,title,message,notification_type,
+                related_booking_id,reference,event_key,is_read,created_at)
+            VALUES(?,?,?,?,?,?,?,0,?)
+        """, (booking["customer_id"], "Parking Expires in 10 Minutes",
+              f"Booking {booking['booking_code']} at {booking['destination_name']}, slot {booking['slot_number']}, expires at {expiry.astimezone(LOCAL_ZONE).strftime('%I:%M %p')}.",
+              "duration_reminder", booking["id"], f"booking:{booking['id']}",
+              f"booking:{booking['id']}:duration-reminder:{booking['expiry_time']}", now()))
+        created += cursor.rowcount
+    return created
+
 def reconcile_overstays(conn):
     """Keep booking overstay records synchronized with the last confirmed slot evidence."""
     current = datetime.now(timezone.utc)
@@ -597,6 +671,7 @@ def reconcile_overstays(conn):
     """, (current_iso,)).fetchall()
     for booking in expired_bookings:
         case = conn.execute("SELECT * FROM overstay_cases WHERE booking_id=?", (booking["id"],)).fetchone()
+        created_case = case is None
         if not case:
             # A post-expiry confirmed detection is required to resolve the case either way.
             # Until then, keep the slot unavailable and label any amount as an estimate.
@@ -610,7 +685,9 @@ def reconcile_overstays(conn):
                   OVERSTAY_RATE_PER_MINUTE, minutes * OVERSTAY_RATE_PER_MINUTE,
                   "awaiting_departure_confirmation", "not_due", current_iso, current_iso))
             case = conn.execute("SELECT * FROM overstay_cases WHERE booking_id=?", (booking["id"],)).fetchone()
+        previous_status = case["status"]
         if case["status"] in ("completed", "penalty_pending", "penalty_paid"):
+            notify_overstay_state(conn, booking, case, previous_status, created_case)
             continue
         prediction = conn.execute("""
             SELECT id,slots,created_at FROM predictions WHERE level_id=? AND status='confirmed' AND confirmed_at=?
@@ -659,6 +736,8 @@ def reconcile_overstays(conn):
                 """, (case["id"], prediction["id"], detected.get("status", "unknown"), evidence_time))
                 conn.execute("UPDATE overstay_cases SET departure_prediction_id=? WHERE id=? AND status='completed'", (prediction["id"], case["id"]))
                 break
+        case = conn.execute("SELECT * FROM overstay_cases WHERE id=?", (case["id"],)).fetchone()
+        notify_overstay_state(conn, booking, case, previous_status, created_case)
 
 def parse_booking_timestamp(value):
     parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
@@ -1022,6 +1101,55 @@ def confirm(prediction_id):
 def profile():
     return jsonify(user=user_json(g.user))
 
+@APP.get("/api/notifications")
+@require_role("customer")
+def customer_notifications():
+    status = request.args.get("filter", "all")
+    if status not in {"all", "read", "unread"}:
+        return jsonify(error="Choose a valid notification filter."), 400
+    try:
+        limit = min(100, max(1, int(request.args.get("limit", 50))))
+        offset = max(0, int(request.args.get("offset", 0)))
+    except (TypeError, ValueError):
+        return jsonify(error="Invalid notification page."), 400
+    clauses = ["user_id=?"]
+    params = [g.user["id"]]
+    if status == "read": clauses.append("is_read=1")
+    if status == "unread": clauses.append("is_read=0")
+    where = " AND ".join(clauses)
+    conn = db()
+    create_due_duration_reminders(conn, customer_id=g.user["id"])
+    conn.commit()
+    rows = conn.execute(f"SELECT id,title,message,notification_type,related_booking_id,reference,is_read,created_at FROM notifications WHERE {where} ORDER BY created_at DESC,id DESC LIMIT ? OFFSET ?", (*params, limit, offset)).fetchall()
+    total = conn.execute(f"SELECT COUNT(*) FROM notifications WHERE {where}", params).fetchone()[0]
+    unread = conn.execute("SELECT COUNT(*) FROM notifications WHERE user_id=? AND is_read=0", (g.user["id"],)).fetchone()[0]
+    return jsonify(notifications=[dict(row) for row in rows], total=total, unread_count=unread)
+
+@APP.get("/api/notifications/unread-count")
+@require_role("customer")
+def customer_notification_count():
+    conn = db()
+    create_due_duration_reminders(conn, customer_id=g.user["id"])
+    conn.commit()
+    count = conn.execute("SELECT COUNT(*) FROM notifications WHERE user_id=? AND is_read=0", (g.user["id"],)).fetchone()[0]
+    return jsonify(unread_count=count)
+
+@APP.patch("/api/notifications/read-all")
+@require_role("customer")
+def mark_all_notifications_read():
+    db().execute("UPDATE notifications SET is_read=1 WHERE user_id=? AND is_read=0", (g.user["id"],))
+    db().commit()
+    return jsonify(message="All notifications marked as read.", unread_count=0)
+
+@APP.patch("/api/notifications/<int:notification_id>/read")
+@require_role("customer")
+def mark_notification_read(notification_id):
+    cursor = db().execute("UPDATE notifications SET is_read=1 WHERE id=? AND user_id=?", (notification_id, g.user["id"]))
+    db().commit()
+    if not cursor.rowcount:
+        return jsonify(error="Notification not found."), 404
+    return jsonify(message="Notification marked as read.")
+
 @APP.get("/api/bookings")
 @require_role("customer")
 def bookings():
@@ -1291,6 +1419,12 @@ def verify_booking_payment(booking_id):
         conn.execute("UPDATE bookings SET status='confirmed',hold_expires_at=NULL WHERE id=? AND customer_id=? AND status='payment_pending'", (booking_id, g.user["id"]))
         conn.execute("UPDATE slot_holds SET status='confirmed' WHERE booking_id=?", (booking_id,))
         conn.execute("UPDATE payments SET provider_payment_id=?,method=?,status='verified',verified_at=? WHERE booking_id=?", (payment_id, str(data.get("method", "razorpay")), now(), booking_id))
+        add_notification(conn, g.user["id"], "Booking confirmed",
+            f"Your booking {row['booking_code']} is confirmed after successful payment.",
+            "booking_confirmed", f"booking:{booking_id}:confirmed", booking_id, f"booking:{booking_id}")
+        add_notification(conn, g.user["id"], "Payment successful",
+            f"Payment for booking {row['booking_code']} was verified successfully.",
+            "payment_success", f"booking:{booking_id}:payment-verified", booking_id, f"booking:{booking_id}")
         conn.commit()
     except Exception:
         conn.rollback()
@@ -1327,6 +1461,12 @@ def create_penalty_payment_order(case_id):
         VALUES(?,?,?,?,?,'created',?)
     """, (case_id,"razorpay",order["id"],case["final_penalty"],case["currency"],created))
     conn.execute("UPDATE overstay_cases SET penalty_payment_status='pending',status='penalty_pending',updated_at=? WHERE id=?", (created,case_id))
+    add_notification(conn, case["customer_id"], "Penalty payment is available",
+        f"The confirmed overstay penalty for booking {case['booking_code']} is ready for payment.",
+        "penalty_due", f"overstay:{case_id}:penalty-due", case["booking_id"], f"overstay:{case_id}")
+    add_notification(conn, case["customer_id"], "Overstay status updated",
+        f"Booking {case['booking_code']} overstay status is now penalty pending.",
+        "overstay_update", f"overstay:{case_id}:status:penalty_pending", case["booking_id"], f"overstay:{case_id}")
     conn.commit()
     return jsonify(payment_id=cur.lastrowid,amount=case["final_penalty"],currency=case["currency"],
                    razorpay={"key_id":RAZORPAY_KEY_ID,"order_id":order["id"],"amount":order["amount"],"currency":order["currency"],"name":"ParkZenOne","description":f"Overstay penalty {case['booking_code']}"}),201
@@ -1361,6 +1501,10 @@ def verify_penalty_payment(case_id):
         stamp = now()
         conn.execute("UPDATE penalty_payments SET provider_payment_id=?,method=?,status='failed',verified_at=? WHERE id=?", (payment_id,str(data.get("method","razorpay")),stamp,row["id"]))
         conn.execute("UPDATE overstay_cases SET penalty_payment_status='failed',status='completed',updated_at=? WHERE id=?", (stamp,case_id))
+        booking = conn.execute("SELECT b.id,b.customer_id,b.booking_code FROM bookings b JOIN overstay_cases oc ON oc.booking_id=b.id WHERE oc.id=?", (case_id,)).fetchone()
+        add_notification(conn, booking["customer_id"], "Penalty payment failed",
+            f"Razorpay could not verify payment for the overstay penalty on booking {booking['booking_code']}. The penalty remains unpaid.",
+            "penalty_payment_failed", f"overstay:{case_id}:payment-failed:{row['id']}", booking["id"], f"overstay:{case_id}")
         conn.commit()
         return jsonify(error="Razorpay reports that penalty payment failed. No penalty was marked paid."), 402
     if details.get("status") != "captured":
@@ -1370,6 +1514,10 @@ def verify_penalty_payment(case_id):
     stamp=now()
     conn.execute("UPDATE penalty_payments SET provider_payment_id=?,method=?,status='verified',verified_at=? WHERE id=? AND status IN ('created','pending')",(payment_id,str(data.get("method","razorpay")),stamp,row["id"]))
     conn.execute("UPDATE overstay_cases SET penalty_payment_status='paid',status='penalty_paid',updated_at=? WHERE id=? AND final_penalty=?",(stamp,case_id,row["final_penalty"]))
+    booking = conn.execute("SELECT b.id,b.customer_id,b.booking_code FROM bookings b JOIN overstay_cases oc ON oc.booking_id=b.id WHERE oc.id=?", (case_id,)).fetchone()
+    add_notification(conn, booking["customer_id"], "Penalty payment successful",
+        f"Your overstay penalty for booking {booking['booking_code']} was verified as paid.",
+        "penalty_paid", f"overstay:{case_id}:penalty-paid", booking["id"], f"overstay:{case_id}")
     conn.commit()
     return jsonify(message="Penalty payment verified.",booking_code="",payment_reference=payment_id)
 
@@ -1660,6 +1808,7 @@ def overstay_monitor():
         try:
             with sqlite3.connect(DB_PATH, timeout=10) as conn:
                 conn.row_factory = sqlite3.Row
+                create_due_duration_reminders(conn)
                 reconcile_overstays(conn)
                 check_capacity_alerts(conn)
                 dispatch_capacity_alert_emails(conn)

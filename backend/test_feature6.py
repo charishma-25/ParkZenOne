@@ -35,6 +35,7 @@ class Feature6Tests(unittest.TestCase):
             ids = [r[0] for r in conn.execute("SELECT id FROM users WHERE role='customer'").fetchall()]
             if ids:
                 slots = ','.join('?' for _ in ids)
+                conn.execute(f"DELETE FROM notifications WHERE user_id IN ({slots})", ids)
                 booking_ids = [r[0] for r in conn.execute(f"SELECT id FROM bookings WHERE customer_id IN ({slots})", ids).fetchall()]
                 if booking_ids:
                     bslots = ','.join('?' for _ in booking_ids)
@@ -263,6 +264,8 @@ class Feature6Tests(unittest.TestCase):
         with parkzen.APP.app_context():
             row = parkzen.db().execute("SELECT b.status,b.total_amount_paise,b.discount_amount_paise,p.amount,p.amount_paise,p.status FROM bookings b JOIN payments p ON p.booking_id=b.id WHERE b.id=?", (quote["booking_id"],)).fetchone()
             self.assertEqual(tuple(row), ("confirmed", 200, 800, 2, 200, "verified"))
+            events = [r[0] for r in parkzen.db().execute("SELECT notification_type FROM notifications WHERE user_id=? AND related_booking_id=? ORDER BY id", (user_id, quote["booking_id"])).fetchall()]
+            self.assertEqual(events, ["booking_confirmed", "payment_success"])
 
     def test_expired_hold_rejects_payment_verification(self):
         user_id, _ = self.add_customer("expired-loyalty")
@@ -307,6 +310,99 @@ class Feature6Tests(unittest.TestCase):
             a = threading.Thread(target=place, args=(client_a, headers_a)); b = threading.Thread(target=place, args=(client_b, headers_b))
             a.start(); b.start(); a.join(15); b.join(15)
         self.assertEqual(sorted(results), [201, 409])
+
+    def test_notifications_are_private_and_read_state_is_owned(self):
+        owner, _ = self.add_customer("notice-owner")
+        other, _ = self.add_customer("notice-other")
+        owner_headers = self.customer_session(owner, "notice-owner-session")
+        other_headers = self.customer_session(other, "notice-other-session")
+        with parkzen.APP.app_context():
+            parkzen.add_notification(parkzen.db(), owner, "Booking confirmed", "It is confirmed.", "booking_confirmed", "test:owner:booking")
+            parkzen.db().commit()
+        result = self.client.get("/api/notifications", headers=owner_headers)
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(len(result.json["notifications"]), 1)
+        notification_id = result.json["notifications"][0]["id"]
+        self.assertEqual(self.client.get("/api/notifications", headers=other_headers).json["notifications"], [])
+        self.assertEqual(self.client.patch(f"/api/notifications/{notification_id}/read", headers=other_headers).status_code, 404)
+        self.assertEqual(self.client.get("/api/notifications/unread-count", headers=owner_headers).json["unread_count"], 1)
+        self.assertEqual(self.client.patch(f"/api/notifications/{notification_id}/read", headers=owner_headers).status_code, 200)
+        self.assertEqual(self.client.get("/api/notifications/unread-count", headers=owner_headers).json["unread_count"], 0)
+        self.assertEqual(self.client.patch("/api/notifications/read-all", headers=owner_headers).status_code, 200)
+
+    def test_overstay_notification_created_once_for_booking_customer(self):
+        user_id, _ = self.add_customer("overstay-notice")
+        headers = self.customer_session(user_id, "overstay-notice-session")
+        with parkzen.APP.app_context():
+            conn = parkzen.db()
+            slot = conn.execute("SELECT ps.id,ps.level_id,pl.destination_id FROM parking_slots ps JOIN parking_levels pl ON pl.id=ps.level_id WHERE pl.destination_id='mall-a' LIMIT 1").fetchone()
+            past = (datetime.now(timezone.utc)-timedelta(minutes=10)).isoformat(timespec="seconds")
+            stamp = parkzen.now()
+            cur = conn.execute("""INSERT INTO bookings(booking_code,customer_id,destination_id,level_id,slot_id,vehicle_type,start_time,expiry_time,duration_minutes,rate_per_block,blocks,total_amount,currency,status,created_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,'confirmed',?)""", ("NOTICE-OVERSTAY",user_id,slot["destination_id"],slot["level_id"],slot["id"],"car",past,past,30,5,1,5,"INR",stamp))
+            conn.execute("UPDATE parking_slots SET status='occupied',updated_at=? WHERE id=?", (stamp,slot["id"]))
+            conn.commit()
+            booking_id = cur.lastrowid
+        self.assertEqual(self.client.get("/api/overstays", headers=headers).status_code, 200)
+        self.assertEqual(self.client.get("/api/overstays", headers=headers).status_code, 200)
+        with parkzen.APP.app_context():
+            notifications = parkzen.db().execute("SELECT notification_type,event_key FROM notifications WHERE user_id=? ORDER BY id", (user_id,)).fetchall()
+            self.assertEqual([row["notification_type"] for row in notifications], ["overstay", "overstay_update"])
+            self.assertEqual(parkzen.db().execute("SELECT related_booking_id FROM notifications WHERE user_id=?", (user_id,)).fetchone()[0], booking_id)
+            self.assertEqual(parkzen.db().execute("SELECT COUNT(*) FROM notifications WHERE event_key LIKE 'overstay:%:created'").fetchone()[0], 1)
+
+    def make_duration_booking(self, suffix, user_id, start, duration_minutes, *, status="confirmed", created_at=None):
+        expiry = start + timedelta(minutes=duration_minutes)
+        created_at = created_at or (start - timedelta(hours=1))
+        with parkzen.APP.app_context():
+            conn = parkzen.db()
+            slot = conn.execute("SELECT ps.id,ps.level_id FROM parking_slots ps JOIN parking_levels pl ON pl.id=ps.level_id WHERE pl.destination_id='mall-a' ORDER BY ps.id LIMIT 1").fetchone()
+            cur = conn.execute("""INSERT INTO bookings(booking_code,customer_id,destination_id,level_id,slot_id,vehicle_type,start_time,expiry_time,duration_minutes,rate_per_block,blocks,total_amount,currency,status,created_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (f"REMINDER-{suffix}",user_id,"mall-a",slot["level_id"],slot["id"],"car",start.isoformat(),expiry.isoformat(),duration_minutes,5,max(1,duration_minutes//30),5,"INR",status,created_at.isoformat()))
+            conn.commit()
+            return cur.lastrowid, expiry
+
+    def test_60_and_90_minute_reminders_are_due_exactly_ten_minutes_before_expiry(self):
+        user_id, _ = self.add_customer("duration-reminders")
+        start = datetime(2026, 10, 12, 12, 0, tzinfo=parkzen.LOCAL_ZONE)
+        booking_id, expiry = self.make_duration_booking("60", user_id, start, 60)
+        with parkzen.APP.app_context():
+            conn = parkzen.db()
+            self.assertEqual(parkzen.create_due_duration_reminders(conn, expiry - timedelta(minutes=10, seconds=1)), 0)
+            self.assertEqual(parkzen.create_due_duration_reminders(conn, expiry - timedelta(minutes=10)), 1)
+            self.assertEqual(parkzen.create_due_duration_reminders(conn, expiry - timedelta(minutes=9)), 0)
+            row = conn.execute("SELECT title,message,event_key FROM notifications WHERE related_booking_id=?", (booking_id,)).fetchone()
+            self.assertEqual(row["title"], "Parking Expires in 10 Minutes")
+            self.assertIn("01:00 PM", row["message"])
+        second_id, second_expiry = self.make_duration_booking("90", user_id, start, 90)
+        with parkzen.APP.app_context():
+            conn = parkzen.db()
+            self.assertEqual(parkzen.create_due_duration_reminders(conn, second_expiry - timedelta(minutes=10)), 1)
+            self.assertIsNotNone(conn.execute("SELECT id FROM notifications WHERE related_booking_id=?", (second_id,)).fetchone())
+
+    def test_reminder_suppresses_cancelled_expired_and_recently_created_bookings(self):
+        user_id, _ = self.add_customer("reminder-suppression")
+        start = datetime(2026, 10, 12, 12, 0, tzinfo=parkzen.LOCAL_ZONE)
+        cancelled_id, expiry = self.make_duration_booking("cancelled", user_id, start, 60, status="cancelled")
+        expired_id, expired_at = self.make_duration_booking("expired", user_id, start, 60, status="expired")
+        late_create_id, _ = self.make_duration_booking("late-create", user_id, start, 60, created_at=expiry - timedelta(minutes=5))
+        with parkzen.APP.app_context():
+            conn = parkzen.db()
+            self.assertEqual(parkzen.create_due_duration_reminders(conn, expiry - timedelta(minutes=4)), 0)
+            self.assertEqual(parkzen.create_due_duration_reminders(conn, expired_at + timedelta(seconds=1)), 0)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM notifications WHERE related_booking_id IN (?,?,?)", (cancelled_id,expired_id,late_create_id)).fetchone()[0], 0)
+
+    def test_extension_recalculates_the_pending_reminder_from_new_expiry(self):
+        user_id, _ = self.add_customer("reminder-extension")
+        start = datetime(2026, 10, 12, 12, 0, tzinfo=parkzen.LOCAL_ZONE)
+        booking_id, old_expiry = self.make_duration_booking("extend", user_id, start, 60)
+        new_expiry = old_expiry + timedelta(minutes=30)
+        with parkzen.APP.app_context():
+            conn = parkzen.db()
+            conn.execute("UPDATE bookings SET expiry_time=?,duration_minutes=90 WHERE id=?", (new_expiry.isoformat(),booking_id))
+            self.assertEqual(parkzen.create_due_duration_reminders(conn, old_expiry-timedelta(minutes=10)), 0)
+            self.assertEqual(parkzen.create_due_duration_reminders(conn, new_expiry-timedelta(minutes=10)), 1)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM notifications WHERE related_booking_id=?", (booking_id,)).fetchone()[0], 1)
 
 
 if __name__ == "__main__":

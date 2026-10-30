@@ -2,6 +2,7 @@
 
 ParkZen is a smart car-parking availability application. Parking managers upload a current image, review detections from the bundled YOLO model, and confirm the count. Customers search destinations and see the latest confirmed update with a Google Maps directions link.
 
+
 ## Architecture
 
 - React 19 and Vite frontend (`src/`)
